@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	accounts "github.com/heartleo/zlib/internal/account"
 	zlib "github.com/heartleo/zlib/internal/zlib"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/spf13/cobra"
@@ -153,6 +154,7 @@ type mcpDownloadBookInput struct {
 	ID           string `json:"id" jsonschema:"Book reference in id:hash format from search, saved, feed, or history results."`
 	Dir          string `json:"dir,omitempty" jsonschema:"Destination directory (supports leading ~). Defaults to ZLIB_DOWNLOAD_DIR or current directory."`
 	SendToKindle bool   `json:"send_to_kindle,omitempty" jsonschema:"Email the downloaded file to the configured Kindle address after saving."`
+	Account      string `json:"account,omitempty" jsonschema:"Pin the download to one saved account (email, label or user id). Omit to let the pool choose."`
 }
 
 type mcpDeleteHistoryInput struct {
@@ -569,29 +571,57 @@ func handleMCPDownloadBook(ctx context.Context, req *mcp.CallToolRequest, in mcp
 	if id == "" {
 		return nil, downloadResult{}, errors.New("id must not be empty (expected id:hash)")
 	}
-	c, err := loadMCPClient(ctx)
-	if err != nil {
-		return nil, downloadResult{}, formatMCPError(err)
-	}
-	book, err := c.FetchBookContext(ctx, id)
-	if err != nil {
-		return nil, downloadResult{}, formatMCPError(fmt.Errorf("failed to fetch book: %w", err))
-	}
-	if book.DownloadURL == "" {
-		return nil, downloadResult{}, fmt.Errorf("no download URL available for book %s", safeText(id))
-	}
-	// Resolved after the fetch so a bad ID leaves no empty directory behind.
+	// Guard on ctx before touching the config directory, the way loadMCPClient
+	// does: a cancelled call must not read or migrate files.
 	if err := ctx.Err(); err != nil {
 		return nil, downloadResult{}, formatMCPError(err)
 	}
+	manager, err := loadManager()
+	if err != nil {
+		return nil, downloadResult{}, formatMCPError(err)
+	}
+	// The manager builds its own clients, so it needs this server's transport
+	// or every download would open a second connection pool.
+	if source := policy.transportSource; source != nil {
+		manager.SetClientOptions(zlib.WithTransportFrom(source))
+	}
+	// Resolved but not created: the manager fetches and downloads in one call,
+	// and an id that does not resolve must not leave an empty directory behind.
 	dir, err := resolveMCPDownloadDir(in.Dir, policy.AllowedDir)
 	if err != nil {
 		return nil, downloadResult{}, formatMCPError(err)
 	}
 
-	progressFn := mcpDownloadProgressReporter(ctx, req, book.Name)
-	dl, err := c.DownloadWithContext(ctx, book.DownloadURL, dir, progressFn)
+	var (
+		bookName string
+		dirErr   error
+	)
+	// The fetch is what creates the directory: OnBook runs once its book is
+	// known, before the first byte is written. A rotation calls it again, so the
+	// creation stays guarded.
+	onBook := func(name string) {
+		bookName = name
+		if dirErr == nil {
+			dirErr = createMCPDownloadDir(dir)
+		}
+	}
+	title := func() string {
+		if bookName != "" {
+			return bookName
+		}
+		return id
+	}
+
+	dl, err := manager.Download(ctx, id, accounts.Options{
+		Dir:      dir,
+		Account:  strings.TrimSpace(in.Account),
+		OnBook:   onBook,
+		Progress: mcpDownloadProgressReporter(ctx, req, title),
+	})
 	if err != nil {
+		if dirErr != nil {
+			return nil, downloadResult{}, formatMCPError(dirErr)
+		}
 		return nil, downloadResult{}, formatMCPError(err)
 	}
 
@@ -600,10 +630,12 @@ func handleMCPDownloadBook(ctx context.Context, req *mcp.CallToolRequest, in mcp
 		path = abs
 	}
 	out := downloadResult{
-		ID:   id,
-		Name: book.Name,
-		Path: path,
-		Size: dl.Size,
+		ID:       id,
+		Name:     dl.BookName,
+		Path:     path,
+		Size:     dl.Size,
+		Account:  dl.Account.Name(),
+		Attempts: dl.Attempts,
 	}
 	var toolRes *mcp.CallToolResult
 	if in.SendToKindle {
@@ -617,7 +649,10 @@ func handleMCPDownloadBook(ctx context.Context, req *mcp.CallToolRequest, in mcp
 	return toolRes, out, nil
 }
 
-func mcpDownloadProgressReporter(ctx context.Context, req *mcp.CallToolRequest, bookName string) func(written, total int64) {
+// mcpDownloadProgressReporter reports a download over MCP progress
+// notifications. bookName is read per event, not once: the manager fetches the
+// title itself, so the first events carry only the id the agent sent.
+func mcpDownloadProgressReporter(ctx context.Context, req *mcp.CallToolRequest, bookName func() string) func(written, total int64) {
 	if req == nil || req.Params == nil || req.Session == nil {
 		return nil
 	}
@@ -625,7 +660,12 @@ func mcpDownloadProgressReporter(ctx context.Context, req *mcp.CallToolRequest, 
 	if token == nil {
 		return nil
 	}
-	title := bookCell(bookName)
+	title := func() string {
+		if bookName == nil {
+			return ""
+		}
+		return bookCell(bookName())
+	}
 	var lastStep int64 = -1
 	return func(written, total int64) {
 		if total > 0 {
@@ -636,7 +676,7 @@ func mcpDownloadProgressReporter(ctx context.Context, req *mcp.CallToolRequest, 
 			lastStep = step
 			_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
 				ProgressToken: token,
-				Message:       fmt.Sprintf("Downloading %s (%d%%)", title, step),
+				Message:       fmt.Sprintf("Downloading %s (%d%%)", title(), step),
 				Progress:      float64(written),
 				Total:         float64(total),
 			})
@@ -646,7 +686,7 @@ func mcpDownloadProgressReporter(ctx context.Context, req *mcp.CallToolRequest, 
 			lastStep = written
 			_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
 				ProgressToken: token,
-				Message:       fmt.Sprintf("Downloading %s", title),
+				Message:       fmt.Sprintf("Downloading %s", title()),
 				Progress:      float64(written),
 			})
 		}
@@ -654,9 +694,11 @@ func mcpDownloadProgressReporter(ctx context.Context, req *mcp.CallToolRequest, 
 }
 
 // resolveMCPDownloadDir picks dir > ZLIB_DOWNLOAD_DIR > allowedDir > ".", and
-// with allowedDir set rejects anything outside it before creating directories.
-// A ZLIB_DOWNLOAD_DIR outside allowedDir is skipped rather than failing every
-// download that omits dir, since the agent cannot change the environment.
+// with allowedDir set rejects anything outside it. It touches no files: the
+// directory is created only once the download has a book to save, so an id that
+// does not resolve leaves nothing behind. A ZLIB_DOWNLOAD_DIR outside
+// allowedDir is skipped rather than failing every download that omits dir,
+// since the agent cannot change the environment.
 func resolveMCPDownloadDir(raw, allowedDir string) (string, error) {
 	dir := strings.TrimSpace(raw)
 	if dir == "" {
@@ -685,10 +727,15 @@ func resolveMCPDownloadDir(raw, allowedDir string) (string, error) {
 			return "", err
 		}
 	}
-	if err := os.MkdirAll(expanded, 0o755); err != nil {
-		return "", fmt.Errorf("failed to create download directory %q: %w", expanded, err)
-	}
 	return expanded, nil
+}
+
+// createMCPDownloadDir creates a directory resolveMCPDownloadDir returned.
+func createMCPDownloadDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create download directory %q: %w", dir, err)
+	}
+	return nil
 }
 
 func handleMCPDeleteHistory(ctx context.Context, _ *mcp.CallToolRequest, in mcpDeleteHistoryInput) (*mcp.CallToolResult, mcpDeleteHistoryResult, error) {

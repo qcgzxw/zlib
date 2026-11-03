@@ -4,6 +4,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	tea "charm.land/bubbletea/v2"
+	accounts "github.com/heartleo/zlib/internal/account"
 	"github.com/spf13/cobra"
 )
 
@@ -19,6 +20,7 @@ func newSavedBooksCommand(name string) *cobra.Command {
 	cmd.Flags().IntP("page", "p", 1, "Page number")
 	cmd.Flags().Bool("json", false, "Print favorites as JSON")
 	addDestDirFlag(cmd)
+	addPoolFlags(cmd)
 	cmd.Flags().Bool("send-to-kindle", false, "Send the downloaded book to Kindle")
 	return cmd
 }
@@ -47,7 +49,9 @@ func runSavedBooks(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		sendToKindle, _ := cmd.Flags().GetBool("send-to-kindle")
-		return runDownload(newDownloadModel(selected.selectedID, dir, c), sendToKindle, cmd)
+		return runPoolDownload(cmd, sendToKindle, func(manager *accounts.Manager) downloadModel {
+			return newDownloadModel(selected.selectedID, dir, manager)
+		})
 	}
 
 	page, _ := cmd.Flags().GetInt("page")

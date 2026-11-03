@@ -66,19 +66,57 @@ func TestLoadNetscapeCookiesRejectsInvalidFile(t *testing.T) {
 	}
 }
 
-func TestImportCookieSessionPersistsCookiesAndDomain(t *testing.T) {
+func TestImportCookieSessionReturnsTheImportedCookies(t *testing.T) {
 	isolateConfigHome(t)
 	path := writeCookieFile(t, `# Netscape HTTP Cookie File
 .z-lib.gd	TRUE	/	TRUE	0	remix_userid	123
 .z-lib.gd	TRUE	/	TRUE	0	remix_userkey	secret
 `)
 
-	count, err := importCookieSession(path, "https://z-lib.gd", time.Now())
+	cookies, count, err := importCookieSession(path, "https://z-lib.gd", time.Now())
 	if err != nil {
 		t.Fatalf("importCookieSession() error = %v", err)
 	}
 	if count != 2 {
 		t.Errorf("importCookieSession() count = %d, want 2", count)
+	}
+	if cookies["remix_userid"] != "123" || cookies["remix_userkey"] != "secret" {
+		t.Errorf("importCookieSession() cookies = %v, want the imported pair", cookies)
+	}
+	// The import must not persist anything by itself: login decides which
+	// account the cookies belong to and saves that decision through the pool.
+	if _, err := config.LoadSession(); err == nil {
+		t.Error("importCookieSession() wrote session.json")
+	}
+}
+
+// The cookie login path hands what importCookieSession returns to saveAccount.
+// Both the pool entry and the session mirror have to carry the cookies.
+func TestImportedCookiesReachThePoolThroughSaveAccount(t *testing.T) {
+	isolateConfigHome(t)
+	path := writeCookieFile(t, `# Netscape HTTP Cookie File
+.z-lib.gd	TRUE	/	TRUE	0	remix_userid	123
+.z-lib.gd	TRUE	/	TRUE	0	remix_userkey	secret
+`)
+
+	cookies, _, err := importCookieSession(path, "https://z-lib.gd", time.Now())
+	if err != nil {
+		t.Fatalf("importCookieSession() error = %v", err)
+	}
+	if err := saveAccount(config.Account{
+		UserID:  strings.TrimSpace(cookies["remix_userid"]),
+		Domain:  "https://z-lib.gd",
+		Cookies: cookies,
+	}, false); err != nil {
+		t.Fatalf("saveAccount() error = %v", err)
+	}
+
+	pool, err := config.LoadAccounts()
+	if err != nil {
+		t.Fatalf("LoadAccounts() error = %v", err)
+	}
+	if len(pool.Accounts) != 1 || pool.Accounts[0].UserID != "123" || pool.Accounts[0].Domain != "https://z-lib.gd" {
+		t.Fatalf("pool = %+v", pool)
 	}
 
 	session, err := config.LoadSession()
@@ -91,6 +129,10 @@ func TestImportCookieSessionPersistsCookiesAndDomain(t *testing.T) {
 	if session.Cookies["remix_userkey"] != "secret" {
 		t.Errorf("session cookies = %v, want imported cookie", session.Cookies)
 	}
+	// Imported cookies are EAPI credentials, so the mirror must say so.
+	if session.Mode != "eapi" {
+		t.Errorf("session.Mode = %q, want eapi", session.Mode)
+	}
 }
 
 // A cookie file can match the domain and still authenticate nothing. Saving it
@@ -101,7 +143,7 @@ func TestImportCookieSessionRejectsFileWithoutAuthCookies(t *testing.T) {
 .z-lib.gd	TRUE	/	TRUE	0	siteLanguage	en
 `)
 
-	_, err := importCookieSession(path, "https://z-lib.gd", time.Now())
+	_, _, err := importCookieSession(path, "https://z-lib.gd", time.Now())
 	if err == nil {
 		t.Fatal("importCookieSession() error = nil, want a missing-auth-cookie error")
 	}
@@ -116,27 +158,8 @@ func TestImportCookieSessionRejectsFileMissingUserKey(t *testing.T) {
 .z-lib.gd	TRUE	/	TRUE	0	remix_userid	123
 `)
 
-	_, err := importCookieSession(path, "https://z-lib.gd", time.Now())
+	_, _, err := importCookieSession(path, "https://z-lib.gd", time.Now())
 	if err == nil || !strings.Contains(err.Error(), "remix_userkey") {
 		t.Fatalf("importCookieSession() error = %v, want it to name remix_userkey", err)
-	}
-}
-
-func TestImportCookieSessionPersistsEAPIMode(t *testing.T) {
-	isolateConfigHome(t)
-	path := writeCookieFile(t, `# Netscape HTTP Cookie File
-.z-lib.gd	TRUE	/	TRUE	0	remix_userid	123
-.z-lib.gd	TRUE	/	TRUE	0	remix_userkey	secret
-`)
-
-	if _, err := importCookieSession(path, "https://z-lib.gd", time.Now(), "eapi"); err != nil {
-		t.Fatalf("importCookieSession() error = %v", err)
-	}
-	session, err := config.LoadSession()
-	if err != nil {
-		t.Fatalf("LoadSession() error = %v", err)
-	}
-	if session.Mode != "eapi" {
-		t.Errorf("session.Mode = %q, want eapi", session.Mode)
 	}
 }

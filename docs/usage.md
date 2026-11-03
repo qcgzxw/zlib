@@ -54,12 +54,64 @@ to stderr, then `Saved to:` with the absolute path on stdout. `--json` replaces
 that last line with one JSON document and skips the folder prompt:
 
 ```json
-{"id":"id:hash","name":"Dune","path":"/home/me/books/Dune.epub","size":1048576}
+{"id":"id:hash","name":"Dune","path":"/home/me/books/Dune.epub","size":1048576,"account":"user@example.com","attempts":1}
 ```
+
+`account` names the account that served the download and `attempts` counts the
+accounts tried before it worked.
 
 With `--send-to-kindle`, the document also has `kindle`: `{"sent":true,"to":"..."}`,
 or `{"sent":false,"error":"..."}` when the book was saved but delivery failed.
 `history --download` accepts `--json` the same way.
+
+## Several accounts
+
+Downloads rotate through every saved account, so a day's quota is the sum of the
+pool. `zlib login` adds an account; it never replaces the default unless it is
+the first one or you pass `--use`.
+
+```sh
+zlib login --email user@example.com
+zlib login --email user@example.com --label work --use
+zlib account list
+zlib account sync
+zlib account sync user@example.com
+zlib account use user@example.com
+zlib account config --strategy round_robin
+zlib account config --reset-time 05:00
+zlib account remove user@example.com
+zlib download "id:hash" --account user@example.com
+zlib download "id:hash" --strategy round_robin
+zlib logout --account user@example.com
+zlib logout --all
+```
+
+`zlib account list` marks the default with `*` and shows each account's cached
+quota. Selection follows the stored strategy: `balanced` (the default) prefers
+the account with the highest share of its daily allowance left; `round_robin`
+walks the saved list in order. Override it for one run with `--strategy`. When an
+account runs out of quota, or its session has expired, the download moves to the
+next usable account and prints which one took over; `download` with `--json`
+reports the same in `account` and `attempts`.
+
+`--account` pins one run to that account. That turns off the rotation, so an
+exhausted account still gets its one try and its own error is reported instead of
+a silent skip. `--account` and `--strategy` are accepted by every command that
+can download from its list: `search`, `history`, `favorites`, `recommended` and
+`most-popular`.
+
+When an account's session expires, its entry stays in the pool, is marked as
+needing a login, and is skipped until you sign in again. Logging in again with
+the same account updates that entry in place — cookies and domain are replaced
+while the cached quota is kept — so re-running `zlib login` never creates a
+duplicate. Importing a cookie file with `--cookies` behaves the same way.
+
+Quota numbers are a local estimate: refreshed from the server when they are older
+than 12 hours, and only for the account about to be used. `zlib account sync`
+refreshes every account on demand. `reset_time` is a local wall-clock time,
+`05:00` by default. The read commands (`search`, `favorites`, `recommended`,
+`most-popular`, `history`, `profile` and Kindle delivery) use the default account,
+so `zlib account use` switches whose collection they show.
 
 ## Saved books, recommendations and history
 
@@ -106,9 +158,11 @@ zlib profile --json
 zlib logout
 ```
 
-`profile` shows account details and daily download quota. JSON output excludes
-authentication keys but includes personal account fields; keep it private.
-`logout` removes the saved session.
+`profile` shows the default account's details and daily download quota. JSON
+output excludes authentication keys but includes personal account fields; keep it
+private. A bare `logout` removes the default account, `--account` names another
+one and `--all` removes every saved account. See
+[Several accounts](#several-accounts) for the pool these commands work on.
 
 ```sh
 zlib theme

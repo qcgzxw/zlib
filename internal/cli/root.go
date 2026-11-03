@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	accounts "github.com/heartleo/zlib/internal/account"
 	"github.com/heartleo/zlib/internal/config"
 	"github.com/heartleo/zlib/internal/zlib"
 	"github.com/mattn/go-runewidth"
@@ -69,6 +70,28 @@ func loadSessionClient() (*zlib.Client, error) {
 	return c, nil
 }
 
+// loadManager opens the account pool for download commands. It is a variable
+// for the same reason loadClient is: tests and the demo recorder substitute a
+// fixture-backed manager.
+var loadManager = openAccountManager
+
+func openAccountManager() (*accounts.Manager, error) {
+	manager, err := accounts.Open()
+	if err != nil {
+		return nil, err
+	}
+	// A full-screen program owns the terminal, so a line on stderr would be
+	// written behind the alt screen where nobody can read it. Only the plain
+	// path reports persist failures here; a download in the TUI gets them
+	// through its own warning callback, which the screen shows.
+	if !isInteractive() {
+		manager.SetPersistErrorHandler(func(err error) {
+			lipgloss.Fprintf(os.Stderr, "%s could not save account state: %v\n", colorFaint(symbolInfo), err)
+		})
+	}
+	return manager, nil
+}
+
 func Execute() {
 	if err := loadDotEnv(); err != nil {
 		lipgloss.Fprintln(os.Stderr, formatCLIError(err))
@@ -100,7 +123,10 @@ func formatCLIError(err error) string {
 		return colorRed(symbolError) + " Cancelled"
 	}
 	var delivery *kindleDeliveryError
+	var exhausted *accounts.AllExhaustedError
 	switch {
+	case errors.As(err, &exhausted):
+		return prefix + " " + safeText(exhausted.Error()) + ". Run `zlib account list` to see the pool."
 	// SMTP errors already name the server, port and TLS mode; a generic
 	// network message would hide whether TLS, auth or the port is wrong.
 	case errors.As(err, &delivery), errors.Is(err, zlib.ErrSMTPSend):

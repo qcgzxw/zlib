@@ -89,10 +89,12 @@ with that value and use an existing destination directory:
 zlib download "id:hash" --dir ./books --json
 ```
 
-`download --json` prints one document, `{"id","name","path","size"}`, with the
-absolute `path` of the saved file; add `--send-to-kindle` and it gains a
-`kindle` object (`sent`, `to` or `error`). Progress lines go to stderr, so
-read stdout only.
+`download --json` prints one document,
+`{"id","name","path","size","account","attempts"}`, with the absolute `path` of
+the saved file; `account` names the account that served it and `attempts` is `1`
+unless the pool had to rotate to another account. Add `--send-to-kindle` and it
+gains a `kindle` object (`sent`, `to` or `error`). Progress lines go to stderr,
+so read stdout only.
 
 Branch on the [exit code](usage.md#exit-codes) rather than on message text: `3`
 means the session needs `zlib login`, `4` a network or mirror problem

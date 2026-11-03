@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	accounts "github.com/heartleo/zlib/internal/account"
 	"github.com/heartleo/zlib/internal/config"
 	"github.com/heartleo/zlib/internal/zlib"
 )
@@ -90,6 +91,10 @@ func demoFind(id string) (demoBook, bool) {
 // drop the extension and size fields the EAPI history sometimes omits.
 var demoHistoryBookJSON = func(b demoBook) map[string]any { return b.json() }
 
+// demoBookDetailJSON renders one book's detail response. It is a variable so
+// tests can serve the incomplete metadata a mirror sometimes returns.
+var demoBookDetailJSON = func(b demoBook) map[string]any { return b.json() }
+
 // demoBookList renders books for a saved/history response; history uses the
 // replaceable renderer.
 func demoBookList(books []demoBook, path string) []map[string]any {
@@ -155,7 +160,7 @@ func newDemoServer() *httptest.Server {
 				reply(w, map[string]any{"success": 0, "error": "Requested book not found"})
 				return
 			}
-			book := b.json()
+			book := demoBookDetailJSON(b)
 			book["description"] = "Fixture data for the zlib demo."
 			reply(w, map[string]any{"success": 1, "book": book})
 		case strings.HasPrefix(path, "/files/"):
@@ -236,6 +241,18 @@ func TestDemo(t *testing.T) {
 		return c, nil
 	}
 	defer func() { loadClient = previous }()
+	// Downloads rotate through the account pool, so the recorder needs a pool
+	// over the same fixture client: the real one would open accounts.json and
+	// dial the network mid-recording.
+	previousManager := loadManager
+	loadManager = func() (*accounts.Manager, error) {
+		c, err := loadClient()
+		if err != nil {
+			return nil, err
+		}
+		return newManagerForClient(t, c), nil
+	}
+	defer func() { loadManager = previousManager }()
 	prevProbe := probeAvailableDomains
 	probeAvailableDomains = func(_ context.Context, _ []string, _ string) []zlib.DomainCheck {
 		return []zlib.DomainCheck{{

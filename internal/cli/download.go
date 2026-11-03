@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	accounts "github.com/heartleo/zlib/internal/account"
+	"github.com/heartleo/zlib/internal/config"
 	"github.com/heartleo/zlib/internal/zlib"
 	"github.com/spf13/cobra"
 )
@@ -31,21 +34,50 @@ var downloadCmd = &cobra.Command{
 			return err
 		}
 		sendToKindle, _ := cmd.Flags().GetBool("send-to-kindle")
-		c, err := loadClient()
-		if err != nil {
-			return err
-		}
-		return runDownload(newDownloadModel(args[0], dir, c), sendToKindle, cmd)
+		return runPoolDownload(cmd, sendToKindle, func(manager *accounts.Manager) downloadModel {
+			return newDownloadModel(args[0], dir, manager)
+		})
 	},
 }
 
 // downloadResult is the --json document a finished download prints.
 type downloadResult struct {
-	ID     string        `json:"id,omitempty"`
-	Name   string        `json:"name,omitempty"`
-	Path   string        `json:"path"`
-	Size   int64         `json:"size"`
-	Kindle *kindleResult `json:"kindle,omitempty"`
+	ID       string        `json:"id,omitempty"`
+	Name     string        `json:"name,omitempty"`
+	Path     string        `json:"path"`
+	Size     int64         `json:"size"`
+	Account  string        `json:"account,omitempty"`
+	Attempts int           `json:"attempts,omitempty"`
+	Kindle   *kindleResult `json:"kindle,omitempty"`
+}
+
+// addPoolFlags registers the account-pool flags on a command that downloads.
+// Every command reaching runPoolDownload must call it: reading an unregistered
+// flag returns an empty string silently, so a missing call would make
+// --account a no-op instead of an error.
+func addPoolFlags(cmd *cobra.Command) {
+	cmd.Flags().String("account", "", "Pin the download to one saved account")
+	cmd.Flags().String("strategy", "", "Selection strategy for this run: balanced or round_robin")
+}
+
+// runPoolDownload builds the download model over the account pool and runs it.
+// The pool opens here rather than when the command starts: the listing paths of
+// these commands never download, so an unreadable accounts.json must not break
+// `zlib search --json` or `zlib history`.
+func runPoolDownload(cmd *cobra.Command, sendToKindle bool, build func(*accounts.Manager) downloadModel) error {
+	// Reading an unregistered flag returns "" rather than an error, so a command
+	// wired here without addPoolFlags would quietly ignore --account.
+	if cmd.Flags().Lookup("account") == nil || cmd.Flags().Lookup("strategy") == nil {
+		return fmt.Errorf("internal error: %s is missing the pool flags", cmd.Name())
+	}
+	manager, err := loadManager()
+	if err != nil {
+		return err
+	}
+	m := build(manager)
+	m.pinAccount, _ = cmd.Flags().GetString("account")
+	m.strategy, _ = cmd.Flags().GetString("strategy")
+	return runDownload(m, sendToKindle, cmd)
 }
 
 // kindleResult reports the Send to Kindle step of a download.
@@ -97,7 +129,14 @@ func runDownload(m downloadModel, sendToKindle bool, cmd *cobra.Command) error {
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
-	result := downloadResult{ID: dm.id, Name: dm.bookName, Path: path, Size: dm.savedSize}
+	result := downloadResult{
+		ID:       dm.id,
+		Name:     dm.bookName,
+		Path:     path,
+		Size:     dm.savedSize,
+		Account:  dm.accountName,
+		Attempts: dm.attempts,
+	}
 	if !jsonOut {
 		lipgloss.Fprintln(os.Stdout)
 		lipgloss.Fprintf(os.Stdout, "%s Saved to: %s (%d bytes)\n",
@@ -105,6 +144,10 @@ func runDownload(m downloadModel, sendToKindle bool, cmd *cobra.Command) error {
 			colorGreen(path),
 			dm.savedSize,
 		)
+		if dm.attempts > 1 {
+			lipgloss.Fprintf(os.Stdout, "%s Served by %s after %d attempts.\n",
+				colorFaint(symbolInfo), safeText(dm.accountName), dm.attempts)
+		}
 	}
 	var deliveryErr error
 	if sendToKindle {
@@ -133,34 +176,52 @@ func runDownloadProgram(m downloadModel) (downloadModel, error) {
 }
 
 // runPlain performs the download without the bubbletea UI, for non-terminal
-// output and --json. It mirrors the fetch-then-download flow of the UI model
-// and records the result on the returned model. Status and progress lines go
-// to status (stderr), keeping stdout for the result. Ctrl+C cancels the
-// transfer, so the library can clean up its partial file before the command
-// exits.
+// output and --json. It mirrors the flow of the UI model and records the result
+// on the returned model. Status and progress lines go to status (stderr),
+// keeping stdout for the result. Ctrl+C cancels the transfer, so the library can
+// clean up its partial file before the command exits.
+//
+// The trap covers the fetch as well, since the manager fetches and downloads in
+// one call: a second Ctrl+C during a hung fetch does not reach the process. That
+// is accepted rather than restructuring the signal handling.
 func (m downloadModel) runPlain(status io.Writer) (downloadModel, error) {
-	downloadURL, name := m.directURL, m.bookName
-	if downloadURL == "" {
-		book, err := m.client.FetchBook(m.id)
-		if err != nil {
-			return m, fmt.Errorf("failed to fetch book: %w", err)
-		}
-		if book.DownloadURL == "" {
-			return m, fmt.Errorf("no download URL available for book %s", m.id)
-		}
-		downloadURL, name = book.DownloadURL, book.Name
-	}
-	m.bookName = name
-
-	// Trap Ctrl+C only for the transfer; during the fetch it still exits
-	// immediately, since nothing has been written yet.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	// The title comes from the server; bookCell strips control sequences.
-	fmt.Fprintf(status, "Downloading: %s\n", bookCell(name))
 	progress := plainProgress{w: status}
-	result, err := m.client.DownloadWithContext(ctx, downloadURL, m.dir, progress.report)
+	headerPrinted := false
+	printHeader := func(name string) {
+		if headerPrinted || name == "" {
+			return
+		}
+		// The title comes from the server; bookCell strips control sequences.
+		fmt.Fprintf(status, "Downloading: %s\n", bookCell(name))
+		m.bookName = name
+		headerPrinted = true
+	}
+	if m.directURL != "" {
+		// A known URL carries its title from the caller, not from the server.
+		printHeader(m.bookName)
+	}
+
+	result, err := m.manager.Download(ctx, m.id, accounts.Options{
+		Dir:      m.dir,
+		URL:      m.directURL,
+		Account:  m.pinAccount,
+		Strategy: m.strategy,
+		Progress: progress.report,
+		OnBook:   printHeader,
+		OnAttempt: func(acct config.Account, attempt int, reason error) {
+			if attempt > 1 {
+				fmt.Fprintf(status, "  %s\n", rotationNote(m.accountName, acct.Name(), reason))
+				progress.reported = 0
+			}
+			m.accountName = acct.Name()
+		},
+		OnWarn: func(warn error) {
+			fmt.Fprintf(status, "  %s\n", safeText(warn.Error()))
+		},
+	})
 	if err != nil {
 		if ctx.Err() != nil {
 			m.state = stateCancelled
@@ -168,15 +229,44 @@ func (m downloadModel) runPlain(status io.Writer) (downloadModel, error) {
 		}
 		return m, err
 	}
+	if result.BookName != "" {
+		m.bookName = result.BookName
+	}
 	m.savedPath = result.FilePath
 	m.savedSize = result.Size
+	m.accountName = result.Account.Name()
+	m.attempts = result.Attempts
 	m.state = stateComplete
 	return m, nil
+}
+
+// rotationReason words why the previous account was dropped. The manager
+// rotates on an exhausted quota and on an expired session, so blaming the quota
+// every time would misreport half the rotations.
+func rotationReason(account string, reason error) string {
+	name := bookCell(account)
+	switch {
+	case errors.Is(reason, zlib.ErrDailyLimitReached):
+		return "Quota exhausted on " + name
+	case errors.Is(reason, zlib.ErrSessionExpired):
+		return "Session expired for " + name
+	default:
+		return "Switching from " + name
+	}
+}
+
+// rotationNote is the one wording both paths report a rotation with, so the
+// plain log and the full-screen status line cannot drift apart.
+func rotationNote(from, to string, reason error) string {
+	return rotationReason(from, reason) + "; trying " + bookCell(to)
 }
 
 // plainProgress prints download progress as plain lines a log or an agent can
 // follow: one line per 10% when the size is known, otherwise one per
 // plainProgressChunk bytes.
+//
+// It lives beside runPlain and rotationReason because they are the plain path;
+// if this file grows again, those three are the natural split.
 type plainProgress struct {
 	w        io.Writer
 	reported int64 // last percent step, or bytes when the total is unknown
@@ -202,6 +292,7 @@ func (p *plainProgress) report(written, total int64) {
 
 func init() {
 	addDestDirFlag(downloadCmd)
+	addPoolFlags(downloadCmd)
 	downloadCmd.Flags().Bool("send-to-kindle", false, "Send the downloaded book to Kindle")
 	downloadCmd.Flags().Bool("json", false, "Print the saved file as JSON; progress goes to stderr")
 }
@@ -221,10 +312,15 @@ type downloadModel struct {
 	width, height  int
 	id             string
 	dir            string
-	client         *zlib.Client
+	manager        *accounts.Manager
+	accountName    string
+	attempts       int
+	pinAccount     string
+	strategy       string
 	state          downloadState
 	bookName       string
 	directURL      string // set to skip fetch and download immediately
+	note           string // latest rotation or quota warning, shown while downloading
 	spinner        spinner.Model
 	progress       progress.Model
 	written        int64
@@ -241,36 +337,38 @@ type downloadModel struct {
 	cancel         context.CancelFunc
 }
 
-type fetchDoneMsg struct{ book zlib.Book }
+type bookNameMsg struct{ name string }
+type attemptMsg struct {
+	account string
+	attempt int
+	reason  error
+}
+type startedMsg struct {
+	ch     chan tea.Msg
+	cancel context.CancelFunc
+}
 type progressMsg struct{ written, total int64 }
+type warnMsg struct{ err error }
 type downloadDoneMsg struct {
-	path string
-	size int64
+	path     string
+	size     int64
+	account  string
+	attempts int
 }
 type errMsg struct{ err error }
 
-func newDownloadModel(id, dir string, c *zlib.Client) downloadModel {
-	s := spinner.New()
-	s.Spinner = spinner.Dot
-	s.Style = lipgloss.NewStyle().Foreground(currentTheme.Accent)
-
-	p := progress.New(
-		progress.WithDefaultBlend(),
-		progress.WithWidth(40),
-	)
-
-	return downloadModel{
-		id:       id,
-		dir:      dir,
-		client:   c,
-		spinner:  s,
-		progress: p,
-	}
+func newDownloadModel(id, dir string, manager *accounts.Manager) downloadModel {
+	m := downloadModel{id: id, dir: dir, manager: manager}
+	m.spinner = spinner.New()
+	m.spinner.Spinner = spinner.Dot
+	m.spinner.Style = lipgloss.NewStyle().Foreground(currentTheme.Accent)
+	m.progress = progress.New(progress.WithDefaultBlend(), progress.WithWidth(40))
+	return m
 }
 
 // newDirectDownloadModel skips the fetch phase and downloads from a known URL.
-func newDirectDownloadModel(bookName, downloadURL, dir string, c *zlib.Client) downloadModel {
-	m := newDownloadModel("", dir, c)
+func newDirectDownloadModel(bookName, downloadURL, dir string, manager *accounts.Manager) downloadModel {
+	m := newDownloadModel("", dir, manager)
 	m.bookName = bookName
 	m.directURL = downloadURL
 	return m
@@ -280,24 +378,48 @@ func (m downloadModel) Init() tea.Cmd {
 	if m.state == stateComplete {
 		return nil
 	}
-	if m.directURL != "" {
-		// Emit a synthetic fetchDoneMsg to skip the HTTP fetch.
-		book := zlib.Book{DownloadURL: m.directURL, Name: m.bookName}
-		return func() tea.Msg { return fetchDoneMsg{book} }
-	}
-	return tea.Batch(m.spinner.Tick, m.fetchCmd())
+	return tea.Batch(m.spinner.Tick, m.startCmd())
 }
 
-func (m downloadModel) fetchCmd() tea.Cmd {
+// startCmd hands the message channel to Update through startedMsg; Update then
+// streams from it with waitForMsg. Building the channel inside the command
+// keeps the model copy-free while still letting Update own the cancel func.
+func (m downloadModel) startCmd() tea.Cmd {
 	return func() tea.Msg {
-		book, err := m.client.FetchBook(m.id)
-		if err != nil {
-			return errMsg{fmt.Errorf("failed to fetch book: %w", err)}
-		}
-		if book.DownloadURL == "" {
-			return errMsg{fmt.Errorf("no download URL available for book %s", m.id)}
-		}
-		return fetchDoneMsg{book}
+		ch := make(chan tea.Msg, 64)
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			defer close(ch)
+			emit := func(msg tea.Msg) {
+				select {
+				case ch <- msg:
+				case <-ctx.Done():
+				}
+			}
+			result, err := m.manager.Download(ctx, m.id, accounts.Options{
+				Dir:      m.dir,
+				URL:      m.directURL,
+				Account:  m.pinAccount,
+				Strategy: m.strategy,
+				Progress: func(written, total int64) { emit(progressMsg{written, total}) },
+				OnBook:   func(name string) { emit(bookNameMsg{name}) },
+				OnAttempt: func(acct config.Account, attempt int, reason error) {
+					emit(attemptMsg{account: acct.Name(), attempt: attempt, reason: reason})
+				},
+				OnWarn: func(err error) { emit(warnMsg{err}) },
+			})
+			if err != nil {
+				emit(errMsg{err})
+				return
+			}
+			emit(downloadDoneMsg{
+				path:     result.FilePath,
+				size:     result.Size,
+				account:  result.Account.Name(),
+				attempts: result.Attempts,
+			})
+		}()
+		return startedMsg{ch: ch, cancel: cancel}
 	}
 }
 
@@ -306,6 +428,19 @@ func waitForMsg(ch <-chan tea.Msg) tea.Cmd {
 	return func() tea.Msg {
 		return <-ch
 	}
+}
+
+// nextMsg keeps the download's message chain alive. Update only ever sees the
+// next manager message because the branch that handled the previous one returns
+// a command that reads one: a branch returning a nil command freezes the UI on
+// the first attempt message and leaves the download goroutine blocked on its
+// buffer. A nil channel — a model driven without startCmd, as several view tests
+// are — stays idle instead of blocking forever.
+func (m downloadModel) nextMsg() tea.Cmd {
+	if m.downloadCh == nil {
+		return nil
+	}
+	return waitForMsg(m.downloadCh)
 }
 
 func (m downloadModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -319,31 +454,45 @@ func (m downloadModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = msg.err
 		return m, tea.Quit
 
-	case fetchDoneMsg:
-		m.state = stateDownloading
-		m.bookName = msg.book.Name
-		ch := make(chan tea.Msg, 64)
-		m.downloadCh = ch
-		ctx, cancel := context.WithCancel(context.Background())
-		m.cancel = cancel
-		go func() {
-			emit := func(msg tea.Msg) {
-				select {
-				case ch <- msg:
-				case <-ctx.Done():
-				}
-			}
-			result, err := m.client.DownloadWithContext(ctx, msg.book.DownloadURL, m.dir, func(w, t int64) {
-				emit(progressMsg{w, t})
-			})
-			if err != nil {
-				emit(errMsg{err})
-			} else {
-				emit(downloadDoneMsg{result.FilePath, result.Size})
-			}
-			close(ch)
-		}()
-		return m, waitForMsg(ch)
+	case startedMsg:
+		m.downloadCh = msg.ch
+		m.cancel = msg.cancel
+		// A known URL already has its title, so the transfer is all that is left.
+		// Otherwise the model keeps its "Fetching book" spinner until the server
+		// names the book.
+		if m.directURL != "" {
+			m.state = stateDownloading
+		}
+		return m, m.nextMsg()
+
+	case bookNameMsg:
+		// A rotation fetches the metadata again; when the next account answers
+		// without a title, the one already on screen is better than the id.
+		if msg.name != "" {
+			m.bookName = msg.name
+		}
+		if m.state == stateFetching {
+			m.state = stateDownloading
+		}
+		return m, m.nextMsg()
+
+	case attemptMsg:
+		if msg.attempt > 1 {
+			m.attempts = msg.attempt
+			m.written, m.total = 0, 0
+			// Same wording as the plain path, and the bar resets with the
+			// counters: the next attempt must not start at the previous
+			// account's percentage.
+			m.note = rotationNote(m.accountName, msg.account, msg.reason)
+			m.accountName = msg.account
+			return m, tea.Batch(m.progress.SetPercent(0), m.nextMsg())
+		}
+		m.accountName = msg.account
+		return m, m.nextMsg()
+
+	case warnMsg:
+		m.note = safeText(msg.err.Error())
+		return m, m.nextMsg()
 
 	case tea.KeyPressMsg:
 		if m.state == stateComplete && m.stayOnComplete {
@@ -393,7 +542,7 @@ func (m downloadModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			pct = float64(m.written) / float64(m.total)
 		}
 		progressCmd := m.progress.SetPercent(pct)
-		return m, tea.Batch(progressCmd, waitForMsg(m.downloadCh))
+		return m, tea.Batch(progressCmd, m.nextMsg())
 
 	case downloadDoneMsg:
 		m.savedPath = msg.path
@@ -402,6 +551,7 @@ func (m downloadModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.savedSize = msg.size
 		m.state = stateComplete
+		m.accountName, m.attempts = msg.account, msg.attempts
 		if m.stayOnComplete {
 			return m, nil
 		}
@@ -426,7 +576,19 @@ func (m downloadModel) View() tea.View {
 	if m.state == stateComplete && m.stayOnComplete {
 		return m.completeView()
 	}
-	return screenView(m.width, m.height, "Download", bookCell(m.bookName), m.viewContent(), "Directory: "+bookCell(m.dir), uiKey("esc", "cancel"))
+	return screenView(m.width, m.height, "Download", bookCell(m.downloadTitle()), m.viewContent(), "Directory: "+bookCell(m.dir), uiKey("esc", "cancel"))
+}
+
+// downloadTitle names the book in the UI. Metadata can arrive without a title,
+// so the id the user asked for stands in for it rather than an empty heading.
+func (m downloadModel) downloadTitle() string {
+	if m.bookName != "" {
+		return m.bookName
+	}
+	if m.id != "" {
+		return m.id
+	}
+	return "this book"
 }
 
 func (m downloadModel) completeLines() []string {
@@ -472,7 +634,7 @@ func (m downloadModel) completeView() tea.View {
 	body := append([]string{}, lines[start:min(len(lines), start+visible)]...)
 	body = append(body, "")
 	body = append(body, buttons...)
-	return screenView(m.width, m.height, "Download complete", bookCell(m.bookName), strings.Join(body, "\n"), status,
+	return screenView(m.width, m.height, "Download complete", bookCell(m.downloadTitle()), strings.Join(body, "\n"), status,
 		bindings...)
 }
 
@@ -495,7 +657,10 @@ func (m downloadModel) viewContent() string {
 			bar = m.progress.ViewAs(1.0)
 		}
 		out := fmt.Sprintf("  Downloading: %s\n  %s%s\n",
-			m.bookName, bar, colorFaint(sizeInfo))
+			bookCell(m.downloadTitle()), bar, colorFaint(sizeInfo))
+		if m.note != "" {
+			out += fmt.Sprintf("\n  %s\n", colorFaint(m.note))
+		}
 		if m.state == stateCancelled {
 			out += fmt.Sprintf("\n  %s %s\n",
 				colorRed(symbolError),

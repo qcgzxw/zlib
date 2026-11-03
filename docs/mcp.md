@@ -5,8 +5,9 @@
 `zlib mcp` runs a local stdio [Model Context Protocol](https://modelcontextprotocol.io)
 server. It exposes search, book details, feeds, history, quota, domain checks,
 downloads and Kindle delivery as tools with structured inputs and outputs. It
-uses the same session (`~/.config/zlib/session.json`) and `.env` settings as the
-CLI.
+uses the same saved session and `.env` settings as the CLI: reads use the default
+account, and downloads rotate through the
+[account pool](configuration.md#account-pool) in `accounts.json`.
 
 ## Requirements
 
@@ -161,6 +162,15 @@ Book lists return `id`, `name`, `authors`, `publisher`, `year`, `language`,
 categories and description. Error messages show only the scheme and host of any
 URL, so signed download links and proxy credentials stay out of transcripts.
 
+`download_book` takes an optional `account` input (email, label or user id) that
+pins the download to one saved account. When it is omitted the pool picks an
+account with quota left, following the saved strategy and moving on when an
+account is exhausted or its session expired. The result names the account that
+served the file in `account` and counts the accounts tried in `attempts`.
+Accounts are managed in a terminal with `zlib login`, `zlib account list` and
+`zlib account use`; the server reads the pool on every call, so changes made
+outside it need no restart.
+
 Cancelling a tool stops its HTTP and SMTP work. A completed file remains saved,
 and mail already accepted by the SMTP server cannot be recalled. A failed Kindle
 step after a download retains the file path in the result; do not download again
@@ -178,6 +188,6 @@ just to retry delivery.
 | `get_download_history` | Read | Paged download history with optional format filter |
 | `get_profile` | Read | Account profile and daily quota |
 | `check_domains` | Read | Probe known mirrors to find reachable domains |
-| `download_book` | Write | Download a book by `id:hash` with MCP progress notifications |
+| `download_book` | Write | Download a book by `id:hash`, optionally pinned to one account, with MCP progress notifications |
 | `delete_download_history` | Write | Remove an entry from remote history by ID or `id:hash` |
 | `send_to_kindle` | Write | Send a local ebook file to Kindle via SMTP |

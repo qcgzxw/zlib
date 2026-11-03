@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"testing"
 
+	accounts "github.com/heartleo/zlib/internal/account"
+	"github.com/heartleo/zlib/internal/config"
 	zlib "github.com/heartleo/zlib/internal/zlib"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -68,6 +71,29 @@ func withDemoMCPFixtures(t *testing.T) {
 		}}
 	}
 	t.Cleanup(func() { probeAvailableDomains = prevProbe })
+
+	// download_book drives the account pool now, so the fixtures need one over
+	// the same demo server: the real pool would be empty and dial the network.
+	prevManager := loadManager
+	loadManager = func() (*accounts.Manager, error) {
+		data := config.Accounts{Accounts: []config.Account{{
+			UserID:  "1",
+			Email:   "reader@example.com",
+			Domain:  server.URL,
+			Cookies: map[string]string{"remix_userid": "1", "remix_userkey": "demo"},
+		}}}
+		manager := accounts.NewManager(data, nil)
+		// A factory keeps defaultSession out of the way: it would reject the
+		// loopback demo URL through ParseAllowedDomain.
+		manager.SetSessionFactory(func(config.Account) (accounts.Session, error) {
+			c := zlib.NewClient(zlib.WithDomain(server.URL))
+			c.SetCookies(map[string]string{"remix_userid": "1", "remix_userkey": "demo"})
+			return c, nil
+		})
+		manager.SetPersist(func(config.Accounts) error { return nil })
+		return manager, nil
+	}
+	t.Cleanup(func() { loadManager = prevManager })
 }
 
 func TestMCPListToolsAndSchemas(t *testing.T) {
@@ -301,6 +327,9 @@ func TestMCPWriteToolsAndProgress(t *testing.T) {
 	if gotDL.ID != "115066162:e9f13b" || gotDL.Name != "Dune" || gotDL.Size <= 0 {
 		t.Errorf("download_book result = %+v", gotDL)
 	}
+	if gotDL.Account != "reader@example.com" || gotDL.Attempts != 1 {
+		t.Errorf("download_book did not report the serving account: %+v", gotDL)
+	}
 	if _, err := os.Stat(gotDL.Path); err != nil {
 		t.Errorf("downloaded file missing at %q: %v", gotDL.Path, err)
 	}
@@ -470,6 +499,59 @@ func TestMCPDownloadBookDoesNotCreateDirForUnknownID(t *testing.T) {
 	}
 	if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
 		t.Errorf("download dir %q was created before the book resolved", dir)
+	}
+}
+
+// A mirror can answer with metadata that has no title. The destination
+// directory is prepared from that metadata, so it must still be created and the
+// download must still be saved.
+func TestMCPDownloadCreatesTheDirectoryForAnUntitledBook(t *testing.T) {
+	withDemoMCPFixtures(t)
+	prevDetail := demoBookDetailJSON
+	demoBookDetailJSON = func(b demoBook) map[string]any {
+		m := b.json()
+		delete(m, "title")
+		return m
+	}
+	t.Cleanup(func() { demoBookDetailJSON = prevDetail })
+
+	ctx := context.Background()
+	session := connectMCPTestSession(t, mcpServerOptions{}, nil)
+	dir := filepath.Join(t.TempDir(), "untitled", "books")
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "download_book",
+		Arguments: map[string]any{"id": "115066162:e9f13b", "dir": dir},
+	})
+	if err != nil {
+		t.Fatalf("download_book: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("download_book without a title failed: %s", toolText(t, res))
+	}
+	var got downloadResult
+	decodeToolJSON(t, res, &got)
+	if got.Name != "" {
+		t.Errorf("untitled download reported name %q", got.Name)
+	}
+	if _, err := os.Stat(got.Path); err != nil {
+		t.Fatalf("untitled book was not saved at %q: %v", got.Path, err)
+	}
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		t.Fatalf("destination %q was not created: %v", dir, err)
+	}
+}
+
+func TestMCPDownloadReportsTheServingAccount(t *testing.T) {
+	out := downloadResult{Path: "/tmp/book.epub", Account: "one@example.com", Attempts: 2}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"account":"one@example.com"`)) {
+		t.Fatalf("json = %s", encoded)
+	}
+	if !bytes.Contains(encoded, []byte(`"attempts":2`)) {
+		t.Fatalf("json = %s", encoded)
 	}
 }
 

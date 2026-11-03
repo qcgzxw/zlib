@@ -11,6 +11,8 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/heartleo/zlib/internal/zlib"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 func TestFormatCLIErrorConvertsEOFToFriendlyMessage(t *testing.T) {
@@ -52,6 +54,16 @@ func executeRootForTest(t *testing.T, args ...string) (string, error) {
 	rootCmd.SetOut(&out)
 	rootCmd.SetErr(&errOut)
 	rootCmd.SetArgs(args)
+	// Cobra builds the generated `completion` command once and binds it to the
+	// writer that was current at that first ExecuteC, so whichever test runs
+	// first would keep every later completion script for itself. Dropping the
+	// cached command makes ExecuteC rebuild it against this call's writer.
+	dropCachedCompletionCmd()
+	// Flag values live on the shared command tree, so a test that passes
+	// --json or --strategy would otherwise decide what the next test sees no
+	// matter which arguments it gives, and shuffling the run order would
+	// change the outcome.
+	resetCommandFlags(rootCmd)
 	t.Cleanup(func() {
 		rootCmd.SetOut(os.Stdout)
 		rootCmd.SetErr(os.Stderr)
@@ -63,6 +75,34 @@ func executeRootForTest(t *testing.T, args ...string) (string, error) {
 		t.Logf("stderr: %s", errOut.String())
 	}
 	return out.String(), err
+}
+
+// dropCachedCompletionCmd removes the generated `completion` command cobra
+// added on an earlier ExecuteC, so the next one builds a fresh copy.
+func dropCachedCompletionCmd() {
+	for _, sub := range rootCmd.Commands() {
+		if sub.Name() == "completion" {
+			rootCmd.RemoveCommand(sub)
+		}
+	}
+}
+
+// resetCommandFlags restores every flag in the tree to its default value.
+func resetCommandFlags(c *cobra.Command) {
+	reset := func(f *pflag.Flag) {
+		if !f.Changed {
+			return
+		}
+		// A parse failure here would be a bad default in the command itself,
+		// and the next parse reports it as the user-facing flag error.
+		_ = f.Value.Set(f.DefValue)
+		f.Changed = false
+	}
+	c.Flags().VisitAll(reset)
+	c.PersistentFlags().VisitAll(reset)
+	for _, sub := range c.Commands() {
+		resetCommandFlags(sub)
+	}
 }
 
 func TestHiddenCompletionCommandGeneratesZshScript(t *testing.T) {

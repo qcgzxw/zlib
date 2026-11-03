@@ -60,3 +60,6 @@ site/zh/
 
 # Local session handoff notes
 /docs/handoff.md
+
+# Agent scratch output (reports, not shipped)
+.agent-out/

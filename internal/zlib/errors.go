@@ -17,6 +17,10 @@ var (
 	ErrPhraseMinWords = errors.New("zlibrary: phrase search requires at least 2 words")
 	ErrUnsupported    = errors.New("zlibrary: feature unavailable in EAPI")
 	ErrDownloadFailed = errors.New("zlibrary: download failed")
+	// ErrDailyLimitReached is returned when the account has spent today's
+	// download allowance. It is per account, so a caller holding several
+	// sessions can retry the same request with another one.
+	ErrDailyLimitReached = errors.New("zlibrary: daily download limit reached")
 	// ErrSMTPSend wraps every failure to deliver a Send-to-Kindle email after
 	// the message was built, so the CLI can show the SMTP cause verbatim.
 	ErrSMTPSend = errors.New("zlibrary: smtp send failed")

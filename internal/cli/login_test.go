@@ -12,6 +12,30 @@ import (
 	"github.com/heartleo/zlib/internal/zlib"
 )
 
+func TestLoginDefaultHintExplainsAnUnchangedDefault(t *testing.T) {
+	pool := config.Accounts{DefaultAccount: "1", Accounts: []config.Account{
+		{UserID: "1", Email: "one@example.com", Domain: "https://example.com"},
+		{UserID: "2", Email: "two@example.com", Domain: "https://example.com"},
+	}}
+	if got := loginDefaultHint(pool, "2", false); !strings.Contains(got, "one@example.com") || !strings.Contains(got, "--use") {
+		t.Fatalf("hint = %q, want the surviving default and the --use remedy", got)
+	}
+	for _, tt := range []struct {
+		name   string
+		pool   config.Accounts
+		userID string
+		use    bool
+	}{
+		{name: "use switched", pool: pool, userID: "2", use: true},
+		{name: "the account is already the default", pool: pool, userID: "1"},
+		{name: "empty pool", pool: config.Accounts{}, userID: "2"},
+	} {
+		if got := loginDefaultHint(tt.pool, tt.userID, tt.use); got != "" {
+			t.Fatalf("%s: hint = %q, want none", tt.name, got)
+		}
+	}
+}
+
 func TestResolveLoginDomain(t *testing.T) {
 	tests := []struct {
 		name       string

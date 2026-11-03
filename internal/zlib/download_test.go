@@ -3,6 +3,7 @@ package zlib
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -339,5 +340,24 @@ func TestDownloadCancelledDuringBackoff(t *testing.T) {
 	}
 	if got := requests.Load(); got != 1 {
 		t.Errorf("requests = %d, want 1", got)
+	}
+}
+
+// Rotation depends on the sentinel surviving the whole download path, not only
+// GetProfile: resolveEAPIFileURL issues the EAPI file request that answers with
+// the quota envelope.
+func TestDownloadPathClassifiesTheDailyLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"success":0,"error":"Daily download limit reached"}`)
+	}))
+	defer server.Close()
+
+	c := NewClient(WithDomain(server.URL))
+	c.SetCookies(map[string]string{"remix_userid": "1", "remix_userkey": "key"})
+
+	_, err := c.Download(server.URL+"/eapi/book/1/abc/file", t.TempDir(), nil)
+	if !errors.Is(err, ErrDailyLimitReached) {
+		t.Fatalf("Download() error = %v, want ErrDailyLimitReached", err)
 	}
 }

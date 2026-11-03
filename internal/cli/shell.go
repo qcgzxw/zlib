@@ -699,17 +699,13 @@ func (m *shellModel) completed() tea.Cmd {
 			page.selectedID = ""
 			page.confirmDownload = false
 			m.previous = page
-			client := page.client
-			if client == nil {
-				var err error
-				client, err = loadClient()
-				if err != nil {
-					m.setError(shellErrorText(err))
-					m.restore()
-					return nil
-				}
+			manager, err := loadManager()
+			if err != nil {
+				m.setError(shellErrorText(err))
+				m.restore()
+				return nil
 			}
-			m.download = newDownloadModel(id, "", client)
+			m.download = newDownloadModel(id, "", manager)
 			return m.chooseDirectory()
 		}
 	case historySelectModel:
@@ -718,7 +714,13 @@ func (m *shellModel) completed() tea.Cmd {
 			page.selected = nil
 			page.confirmDownload = false
 			m.previous = page
-			m.download = newDownloadModel(historyCommandID(item), "", page.client)
+			manager, err := loadManager()
+			if err != nil {
+				m.setError(shellErrorText(err))
+				m.restore()
+				return nil
+			}
+			m.download = newDownloadModel(historyCommandID(item), "", manager)
 			return m.chooseDirectory()
 		}
 	case downloadDirectoryModel:
@@ -729,16 +731,18 @@ func (m *shellModel) completed() tea.Cmd {
 		m.restore()
 		return nil
 	case downloadModel:
-		if page.err != nil {
+		// A cancel can arrive as an errMsg carrying context.Canceled, so the
+		// cancelled state wins over the error, exactly as in runDownload.
+		if page.state == stateCancelled {
+			m.kindleReturn = nil
+			m.restore()
+			m.setNotice("Download cancelled")
+		} else if page.err != nil {
 			book := page.bookName
 			if book == "" {
 				book = page.id
 			}
 			return m.open("download-error", shellErrorModel{title: "Download failed", subtitle: bookCell(book), detail: downloadFailureDetail(page.err), retry: true})
-		} else if page.state == stateCancelled {
-			m.kindleReturn = nil
-			m.restore()
-			m.setNotice("Download cancelled")
 		} else if page.sendToKindle {
 			page.sendToKindle = false
 			page.completeAction = 0
@@ -755,7 +759,7 @@ func (m *shellModel) completed() tea.Cmd {
 		return nil
 	case shellErrorModel:
 		if page.selectedRetry && page.retry {
-			m.download = newDownloadModel(m.download.id, m.download.dir, m.download.client)
+			m.download = newDownloadModel(m.download.id, m.download.dir, m.download.manager)
 			return m.open("download", m.download)
 		}
 		if m.kindleReturn != nil {
@@ -895,11 +899,16 @@ func shellLogin(ctx context.Context, fields []formField) shellText {
 	if err = ctx.Err(); err != nil {
 		return shellText{err: err}
 	}
-	err = config.SaveSession(config.Session{Cookies: c.Cookies(), Domain: c.Domain(), Mode: string(zlib.ClientModeEAPI)})
-	if err == nil {
-		_ = rememberLoginEmail(fields[0].value)
+	if err = saveAccount(config.Account{
+		UserID:  strings.TrimSpace(c.Cookies()["remix_userid"]),
+		Email:   strings.TrimSpace(fields[0].value),
+		Domain:  c.Domain(),
+		Cookies: c.Cookies(),
+	}, false); err != nil {
+		return shellText{err: err}
 	}
-	return shellText{text: "Logged in", err: err}
+	_ = rememberLoginEmail(fields[0].value)
+	return shellText{text: "Logged in"}
 }
 
 func (m shellModel) View() tea.View {

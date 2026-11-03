@@ -194,6 +194,31 @@ func TestShellDownloadReturnsToSelectedBook(t *testing.T) {
 	}
 }
 
+// A cancel can leave a context.Canceled behind in page.err (whether errMsg wins
+// the race is up to the scheduler). The shell must report "cancelled" in that
+// case, not a failure with a retry button.
+func TestShellDownloadCancelWinsOverAStrayError(t *testing.T) {
+	isolateConfigHome(t)
+	m := newShellModel()
+	list := newBookFeedSelectModel("Recommended", nil)
+	list.state = searchStateResults
+	list.books = []zlib.Book{{ID: "1", Hash: "abc", Name: "First"}}
+	m.open("list", list)
+	m.previous = m.page
+	download := newDownloadModel("1:abc", t.TempDir(), nil)
+	download.state = stateCancelled
+	download.err = context.Canceled
+	m.open("download", download)
+
+	m, _ = shellStep(m, shellEvent{generation: m.generation, msg: tea.QuitMsg{}})
+	if m.kind == "download-error" {
+		t.Fatal("a cancel was reported as a download failure")
+	}
+	if m.kind != "list" || m.status != "Download cancelled" {
+		t.Fatalf("kind = %q, status = %q", m.kind, m.status)
+	}
+}
+
 func TestShellDownloadKindleActionReturnsToCompletion(t *testing.T) {
 	isolateConfigHome(t)
 	t.Setenv(kindleSMTPPasswordEnv, "")

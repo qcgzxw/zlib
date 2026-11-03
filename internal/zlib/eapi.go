@@ -231,11 +231,16 @@ func (c *Client) eapiRequest(ctx context.Context, method, path string, values ur
 	}
 
 	// A non-2xx EAPI response still carries {"success":0,"error":"..."}. Hand
-	// that body to the caller so the server's message ("daily limit reached",
-	// "not authorized") survives instead of being flattened into an opaque
-	// status error.
+	// that body to the caller so the server's message ("not authorized",
+	// "book not found") survives instead of being flattened into an opaque
+	// status error. Quota rejections are the exception: they become
+	// ErrDailyLimitReached so a caller with several accounts can retry.
 	if err := validateStatus(resp); err != nil && !isEAPIEnvelope(responseBody) {
 		return nil, err
+	}
+	// A rejected quota is not a rejected session, so it is classified first.
+	if path != eapiLoginPath && isEAPIDailyLimitRejection(responseBody, path) {
+		return nil, ErrDailyLimitReached
 	}
 	// A revoked or expired remix_userkey is answered with HTTP 400 and
 	// {"success":0,"error":"Invalid credentials"} (or "Please login") on every
@@ -246,6 +251,35 @@ func (c *Client) eapiRequest(ctx context.Context, method, path string, values ur
 		return nil, ErrSessionExpired
 	}
 	return responseBody, nil
+}
+
+// isEAPIDailyLimitRejection reports whether body is the envelope EAPI returns
+// when the account has no downloads left today. The exact wording is not
+// documented, so every candidate is matched loosely and the caller only has to
+// treat the sentinel as "try another account". A wording that names downloads
+// is unambiguous; a bare "daily limit" also covers per-endpoint request caps,
+// so it only counts on the download endpoint.
+func isEAPIDailyLimitRejection(body []byte, path string) bool {
+	var envelope struct {
+		Success *int   `json:"success"`
+		Error   string `json:"error"`
+	}
+	if err := decodeEAPIJSON(body, &envelope); err != nil || envelope.Success == nil || *envelope.Success != 0 {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(envelope.Error))
+	if !strings.Contains(text, "limit") {
+		return false
+	}
+	if strings.Contains(text, "download") {
+		return true
+	}
+	return strings.Contains(text, "daily") && isEAPIFilePath(path)
+}
+
+// isEAPIFilePath reports whether path is the download endpoint.
+func isEAPIFilePath(path string) bool {
+	return strings.HasPrefix(path, "/eapi/book/") && strings.HasSuffix(path, "/file")
 }
 
 // isEAPISessionRejection reports whether body is the envelope EAPI returns

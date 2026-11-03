@@ -8,6 +8,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"charm.land/lipgloss/v2/table"
+	accounts "github.com/heartleo/zlib/internal/account"
 	"github.com/heartleo/zlib/internal/zlib"
 	"github.com/mattn/go-runewidth"
 	"github.com/spf13/cobra"
@@ -50,14 +51,18 @@ var historyCmd = &cobra.Command{
 				return err
 			}
 			if item.DownloadURL == "" {
-				return runDownload(newDownloadModel(historyCommandID(item), dir, c), sendToKindle, cmd)
+				return runPoolDownload(cmd, sendToKindle, func(manager *accounts.Manager) downloadModel {
+					return newDownloadModel(historyCommandID(item), dir, manager)
+				})
 			}
 
 			bookName := item.Name
 			if bookName == "" {
 				bookName = downloadID
 			}
-			return runDownload(historyDirectDownload(item, bookName, dir, c), sendToKindle, cmd)
+			return runPoolDownload(cmd, sendToKindle, func(manager *accounts.Manager) downloadModel {
+				return historyDirectDownload(item, bookName, dir, manager)
+			})
 		}
 
 		// No flags: interactive mode (--json always forces the static path)
@@ -76,13 +81,17 @@ var historyCmd = &cobra.Command{
 			}
 			item := hm.selected
 			if item.DownloadURL == "" {
-				return runDownload(newDownloadModel(historyCommandID(*item), dir, c), sendToKindle, cmd)
+				return runPoolDownload(cmd, sendToKindle, func(manager *accounts.Manager) downloadModel {
+					return newDownloadModel(historyCommandID(*item), dir, manager)
+				})
 			}
 			bookName := item.Name
 			if bookName == "" {
 				bookName = bookIDFromURL(item.URL)
 			}
-			return runDownload(historyDirectDownload(*item, bookName, dir, c), sendToKindle, cmd)
+			return runPoolDownload(cmd, sendToKindle, func(manager *accounts.Manager) downloadModel {
+				return historyDirectDownload(*item, bookName, dir, manager)
+			})
 		}
 
 		result, err := loadHistoryPage(cmd.Context(), c, page, formatFilter)
@@ -158,6 +167,7 @@ func init() {
 	historyCmd.Flags().IntP("page", "p", 1, "Page number")
 	historyCmd.Flags().StringP("download", "D", "", "Download a book from history by ID")
 	addDestDirFlag(historyCmd)
+	addPoolFlags(historyCmd)
 	historyCmd.Flags().Bool("send-to-kindle", false, "Send the downloaded book to Kindle")
 	historyCmd.Flags().StringP("format", "f", "", "Filter by file format, e.g. epub")
 	historyCmd.Flags().Bool("json", false, "Print history as JSON")
@@ -193,8 +203,8 @@ func findHistoryItemByBookID(c *zlib.Client, bookID string) (zlib.DownloadHistor
 
 // historyDirectDownload downloads a history entry from its known URL. It keeps
 // the entry's id:hash reference so `history --download --json` reports it.
-func historyDirectDownload(item zlib.DownloadHistoryItem, bookName, dir string, c *zlib.Client) downloadModel {
-	m := newDirectDownloadModel(bookName, item.DownloadURL, dir, c)
+func historyDirectDownload(item zlib.DownloadHistoryItem, bookName, dir string, manager *accounts.Manager) downloadModel {
+	m := newDirectDownloadModel(bookName, item.DownloadURL, dir, manager)
 	m.id = historyCommandID(item)
 	return m
 }

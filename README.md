@@ -119,6 +119,7 @@ zlib search "dune" --ext epub --json --count 10
 | Browse popular books             | `zlib most-popular`            |
 | Browse download history          | `zlib history`                 |
 | Check account and quota          | `zlib profile`                 |
+| List saved accounts and quota    | `zlib account list`            |
 | Send to [Kindle](docs/kindle.md) | `zlib kindle send ./book.epub` |
 
 To download, replace `id:hash` with a book's complete `id` from
@@ -127,6 +128,9 @@ the results:
 ```sh
 zlib download "id:hash"
 ```
+
+Several accounts can share the work: `zlib login` adds one, and downloads rotate
+through the pool. See [several accounts](docs/usage.md#several-accounts).
 
 Run `zlib <command> --help` for flags. [Usage](docs/usage.md) covers filters,
 pagination, and download options.

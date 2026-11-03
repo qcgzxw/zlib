@@ -7,6 +7,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"charm.land/lipgloss/v2/table"
+	accounts "github.com/heartleo/zlib/internal/account"
 	zlib "github.com/heartleo/zlib/internal/zlib"
 	"github.com/mattn/go-runewidth"
 	"github.com/spf13/cobra"
@@ -49,7 +50,9 @@ var searchCmd = &cobra.Command{
 			}
 			sendToKindle, _ := cmd.Flags().GetBool("send-to-kindle")
 
-			return runDownload(newDownloadModel(selectedID, dir, c), sendToKindle, cmd)
+			return runPoolDownload(cmd, sendToKindle, func(manager *accounts.Manager) downloadModel {
+				return newDownloadModel(selectedID, dir, manager)
+			})
 		}
 
 		query := strings.Join(args, " ")
@@ -223,6 +226,7 @@ func init() {
 	searchCmd.Flags().IntP("page", "p", 1, "Page number")
 	searchCmd.Flags().IntP("count", "n", defaultSearchPageSize, "Results per page")
 	addDestDirFlag(searchCmd)
+	addPoolFlags(searchCmd)
 	searchCmd.Flags().Bool("send-to-kindle", false, "Send the downloaded book to Kindle")
 	searchCmd.Flags().StringArray("ext", nil, "Filter by file extension, e.g. epub or pdf (repeatable)")
 	searchCmd.Flags().StringArray("format", nil, "Alias for --ext")

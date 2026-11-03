@@ -29,7 +29,6 @@ var loginCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		mode := string(zlib.ClientModeEAPI)
 		if cookieFile != "" {
 			if email != "" || password != "" {
 				return fmt.Errorf("--cookies cannot be combined with --email or --password")
@@ -42,11 +41,22 @@ var loginCmd = &cobra.Command{
 				lipgloss.Fprintf(os.Stdout, "%s %s redirects to %s; logging in there.\n", colorCyan(symbolInfo), domain, resolved)
 				domain = resolved
 			}
-			count, err := importCookieSession(cookieFile, domain, time.Now(), mode)
+			cookies, count, err := importCookieSession(cookieFile, domain, time.Now())
 			if err != nil {
 				return fmt.Errorf("failed to import cookies: %w", err)
 			}
-			lipgloss.Fprintf(os.Stdout, "%s Imported %d cookies.\n", colorGreen(symbolSuccess), count)
+			label, _ := cmd.Flags().GetString("label")
+			use, _ := cmd.Flags().GetBool("use")
+			userID := strings.TrimSpace(cookies["remix_userid"])
+			if err := saveAccount(config.Account{
+				UserID:  userID,
+				Label:   strings.TrimSpace(label),
+				Domain:  domain,
+				Cookies: cookies,
+			}, use); err != nil {
+				return fmt.Errorf("failed to save session: %w", err)
+			}
+			lipgloss.Fprintf(os.Stdout, "%s Imported %d cookies.%s\n", colorGreen(symbolSuccess), count, loginDefaultHint(poolForHint(), userID, use))
 			reportPersistedDomain(cmd.OutOrStdout(), cmd.ErrOrStderr(), domain)
 			return nil
 		}
@@ -87,21 +97,50 @@ var loginCmd = &cobra.Command{
 			return fmt.Errorf("login failed: %w", err)
 		}
 
-		if err := config.SaveSession(config.Session{
-			Cookies: c.Cookies(),
+		userID := strings.TrimSpace(c.Cookies()["remix_userid"])
+		if userID == "" {
+			return fmt.Errorf("login response carried no account id")
+		}
+		label, _ := cmd.Flags().GetString("label")
+		use, _ := cmd.Flags().GetBool("use")
+		if err := saveAccount(config.Account{
+			UserID:  userID,
+			Email:   strings.TrimSpace(email),
+			Label:   strings.TrimSpace(label),
 			Domain:  c.Domain(),
-			Mode:    mode,
-		}); err != nil {
+			Cookies: c.Cookies(),
+		}, use); err != nil {
 			return fmt.Errorf("failed to save session: %w", err)
 		}
 		if err := rememberLoginEmail(email); err != nil {
 			lipgloss.Fprintf(cmd.ErrOrStderr(), "Could not remember login email: %v\n", err)
 		}
 
-		lipgloss.Fprintf(os.Stdout, "%s Logged in successfully.\n", colorGreen(symbolSuccess))
+		lipgloss.Fprintf(os.Stdout, "%s Logged in successfully.%s\n", colorGreen(symbolSuccess), loginDefaultHint(poolForHint(), userID, use))
 		reportPersistedDomain(cmd.OutOrStdout(), cmd.ErrOrStderr(), c.Domain())
 		return nil
 	},
+}
+
+// loginDefaultHint says where a login without --use left the default, so
+// logging into a second account does not look like it took over. It is empty
+// when saying so would only repeat the obvious.
+func loginDefaultHint(pool config.Accounts, userID string, use bool) string {
+	if use || pool.DefaultAccount == "" || pool.DefaultAccount == userID {
+		return ""
+	}
+	return fmt.Sprintf(" Default account is still %s; pass --use to switch.", defaultName(pool))
+}
+
+// poolForHint reloads the pool once a login was saved, to describe where the
+// default ended up. A read failure costs the hint and nothing else, so the
+// error is dropped.
+func poolForHint() config.Accounts {
+	pool, err := config.LoadAccounts()
+	if err != nil {
+		return config.Accounts{}
+	}
+	return pool
 }
 
 // reportPersistedDomain records the domain a login just used as ZLIB_DOMAIN in
@@ -203,6 +242,8 @@ func init() {
 	loginCmd.Flags().String("password", "", "Account password")
 	loginCmd.Flags().String("cookies", "", "Import a Netscape cookie file")
 	loginCmd.Flags().String("domain", "", "Login domain (falls back to $ZLIB_DOMAIN)")
+	loginCmd.Flags().String("label", "", "Display name for the account (optional)")
+	loginCmd.Flags().Bool("use", false, "Make the account just logged in the default")
 	loginCmd.Flags().Bool("eapi", false, "Use EAPI (now the only mode)")
 	loginCmd.Flags().MarkHidden("eapi")
 }

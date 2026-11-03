@@ -8,6 +8,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"charm.land/lipgloss/v2/table"
+	accounts "github.com/heartleo/zlib/internal/account"
 	zlib "github.com/heartleo/zlib/internal/zlib"
 	"github.com/mattn/go-runewidth"
 	"github.com/spf13/cobra"
@@ -52,7 +53,9 @@ func newBookFeedCommand(name, description, summary string, load func(*zlib.Clien
 					return err
 				}
 				sendToKindle, _ := cmd.Flags().GetBool("send-to-kindle")
-				return runDownload(newDownloadModel(selected.selectedID, dir, c), sendToKindle, cmd)
+				return runPoolDownload(cmd, sendToKindle, func(manager *accounts.Manager) downloadModel {
+					return newDownloadModel(selected.selectedID, dir, manager)
+				})
 			}
 
 			books, err := fetch()
@@ -74,6 +77,7 @@ func newBookFeedCommand(name, description, summary string, load func(*zlib.Clien
 	}
 	cmd.Flags().Bool("json", false, "Print books as JSON")
 	addDestDirFlag(cmd)
+	addPoolFlags(cmd)
 	cmd.Flags().Bool("send-to-kindle", false, "Send the downloaded book to Kindle")
 	return cmd
 }

@@ -116,6 +116,7 @@ zlib search "dune" --ext epub --json --count 10
 | 浏览热门图书                    | `zlib most-popular`            |
 | 浏览下载历史                    | `zlib history`                 |
 | 查看账号与配额                  | `zlib profile`                 |
+| 查看已保存的账号与配额          | `zlib account list`            |
 | 发送到 [Kindle](docs/kindle.md) | `zlib kindle send ./book.epub` |
 
 下载时，将 `id:hash` 替换为结果中书籍的完整 `id`：

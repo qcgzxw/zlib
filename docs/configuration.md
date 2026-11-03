@@ -189,12 +189,40 @@ These files live under `~/.config/zlib/`:
 | File | Contents |
 | --- | --- |
 | `.env` | Environment settings and any secrets you add |
-| `session.json` | Login cookies and domain |
+| `session.json` | Login cookies and domain of the default account |
+| `accounts.json` | Saved accounts, quota cache and selection strategy |
+| `accounts.json.broken` | An unreadable pool moved aside by `zlib logout`; safe to delete once you have no use for it |
 | `config.json` | Theme and last successful login email |
 | `kindle.json` | Kindle recipient, sender and SMTP server settings |
 
 Login does not save your password. Session cookies provide account access, so
-keep `session.json` and exported Cookie files private. The Kindle configuration
-file does not contain the SMTP password; the CLI reads it from `ZLIB_SMTP_PWD`.
+keep `session.json`, `accounts.json` and exported Cookie files private. The
+Kindle configuration file does not contain the SMTP password; the CLI reads it
+from `ZLIB_SMTP_PWD`.
 
 Interactive downloads show the destination before starting. Choose **Skip** (the default) or press Esc to keep it. Choose **Change directory** to enter a path; Ctrl+B opens the directory browser, Enter opens a folder, and Space selects it. The change applies only to that download. Ctrl+C cancels. An explicit `--dir` or non-interactive execution skips this prompt. Without `--dir` or `ZLIB_DOWNLOAD_DIR`, downloads still use the working directory.
+
+## Account pool
+
+`accounts.json` holds every saved account, the cached daily quota and the
+selection strategy. It carries the session cookies of each account, so treat it
+like `session.json`; the file is written with owner-only permissions.
+
+`reset_time` is a local wall-clock time (`05:00` by default); the EAPI reports
+used and allowed counts but no reset instant, so the value is an estimate. The
+stored strategy is `balanced` or `round_robin`. `zlib account config` shows both
+and sets either:
+
+```sh
+zlib account config                      # show strategy and reset time
+zlib account config --strategy balanced
+zlib account config --reset-time 05:00
+```
+
+Both values apply to every saved account.
+
+`ZLIB_DOMAIN` still overrides the domain stored with each account, so every
+download in the pool goes through it. `session.json` mirrors the default account
+for older binaries and for the read commands, and is rewritten whenever the
+default changes. A legacy `session.json` becomes a one-account pool the first time
+a command reads `accounts.json`.

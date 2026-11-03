@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/heartleo/zlib/internal/config"
 	"github.com/heartleo/zlib/internal/zlib"
 )
 
@@ -126,41 +125,36 @@ func cookieDomainMatches(targetHost, cookieDomain string, includeSubdomains bool
 	return includeSubdomains && strings.HasSuffix(targetHost, "."+cookieDomain)
 }
 
-func importCookieSession(cookieFile, domain string, now time.Time, modes ...string) (int, error) {
+// importCookieSession reads a Netscape cookie export and returns the cookies
+// that authenticate against domain, with how many it kept. It persists nothing:
+// login owns the pool, and the account the cookies belong to is decided there.
+func importCookieSession(cookieFile, domain string, now time.Time) (map[string]string, int, error) {
 	path, err := expandTilde(cookieFile)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	if strings.TrimSpace(domain) == "" {
-		return 0, fmt.Errorf("cookie domain is not configured")
+		return nil, 0, fmt.Errorf("cookie domain is not configured")
 	}
 	domain, err = zlib.ParseAllowedDomain(domain)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 
 	cookies, err := loadNetscapeCookies(path, domain, now)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	if len(cookies) == 0 {
-		return 0, fmt.Errorf("no unexpired root cookies match %s", domain)
+		return nil, 0, fmt.Errorf("no unexpired root cookies match %s", domain)
 	}
 	// A file can match the domain and still carry nothing that authenticates.
 	// Rejecting it here beats saving a useless session and failing every later
 	// command with an opaque "session expired".
 	for _, name := range []string{"remix_userid", "remix_userkey"} {
 		if strings.TrimSpace(cookies[name]) == "" {
-			return 0, fmt.Errorf("cookie file has no %s cookie for %s; export it while logged in", name, domain)
+			return nil, 0, fmt.Errorf("cookie file has no %s cookie for %s; export it while logged in", name, domain)
 		}
 	}
-
-	mode := ""
-	if len(modes) > 0 {
-		mode = modes[0]
-	}
-	if err := config.SaveSession(config.Session{Cookies: cookies, Domain: domain, Mode: mode}); err != nil {
-		return 0, fmt.Errorf("save imported session: %w", err)
-	}
-	return len(cookies), nil
+	return cookies, len(cookies), nil
 }

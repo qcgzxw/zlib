@@ -100,7 +100,7 @@ func TestEAPIPreservesServerErrorOnNon2xx(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprint(w, `{"success":0,"error":"Daily download limit reached"}`)
+		fmt.Fprint(w, `{"success":0,"error":"Book not found"}`)
 	}))
 	defer server.Close()
 
@@ -112,7 +112,7 @@ func TestEAPIPreservesServerErrorOnNon2xx(t *testing.T) {
 	if err == nil {
 		t.Fatal("searchEAPI() error = nil, want the server message")
 	}
-	if !strings.Contains(err.Error(), "Daily download limit reached") {
+	if !strings.Contains(err.Error(), "Book not found") {
 		t.Errorf("searchEAPI() error = %v, want it to carry the server message", err)
 	}
 }
@@ -267,18 +267,97 @@ func TestEAPIRequestKeepsOtherRejectionsAndLoginFailures(t *testing.T) {
 			fmt.Fprint(w, `{"success":0,"error":"Invalid credentials"}`)
 			return
 		}
-		fmt.Fprint(w, `{"success":0,"error":"Daily limit reached"}`)
+		fmt.Fprint(w, `{"success":0,"error":"Book not found"}`)
 	}))
 	defer server.Close()
 	client := NewClient(WithDomain(server.URL))
 	client.SetCookies(map[string]string{"remix_userid": "123", "remix_userkey": "key"})
 
-	if _, err := client.SavedBooks(1); errors.Is(err, ErrSessionExpired) || err == nil || !strings.Contains(err.Error(), "Daily limit reached") {
+	if _, err := client.SavedBooks(1); errors.Is(err, ErrSessionExpired) || err == nil || !strings.Contains(err.Error(), "Book not found") {
 		t.Fatalf("SavedBooks error = %v, want the server message", err)
 	}
 	// A wrong password must read as a failed login, even with a stale session
 	// still loaded in the client.
 	if err := client.Login("reader@example.com", "wrong"); !errors.Is(err, ErrLoginFailed) || errors.Is(err, ErrSessionExpired) {
 		t.Fatalf("Login error = %v, want ErrLoginFailed only", err)
+	}
+}
+
+func TestEAPIDailyLimitIsClassified(t *testing.T) {
+	for _, message := range []string{
+		"Daily download limit reached",
+		"Download limit reached.",
+	} {
+		t.Run(message, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprintf(w, `{"success":0,"error":%q}`, message)
+			}))
+			defer server.Close()
+			_, err := newLoggedInEAPITestClient(server.URL).GetProfile()
+			if !errors.Is(err, ErrDailyLimitReached) {
+				t.Fatalf("error = %v, want ErrDailyLimitReached", err)
+			}
+		})
+	}
+}
+
+// A bare "daily limit" also describes a per-endpoint request cap, so it may
+// only be read as an exhausted download allowance on the download endpoint.
+func TestEAPIBareDailyLimitIsQuotaOnlyOnTheFileEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"success":0,"error":"Daily limit reached"}`)
+	}))
+	defer server.Close()
+
+	client := newLoggedInEAPITestClient(server.URL)
+	_, err := client.Download(server.URL+"/eapi/book/1/abc/file", t.TempDir(), nil)
+	if !errors.Is(err, ErrDailyLimitReached) {
+		t.Fatalf("Download() error = %v, want ErrDailyLimitReached", err)
+	}
+	if _, err := client.GetProfile(); errors.Is(err, ErrDailyLimitReached) {
+		t.Fatalf("GetProfile() error = %v, must not be ErrDailyLimitReached", err)
+	}
+}
+
+func TestEAPILoginIsNeverADailyLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"success":0,"error":"Daily download limit reached"}`)
+	}))
+	defer server.Close()
+
+	err := NewClient(WithDomain(server.URL)).Login("reader@example.com", "pw")
+	if !errors.Is(err, ErrLoginFailed) || errors.Is(err, ErrDailyLimitReached) {
+		t.Fatalf("Login() error = %v, want ErrLoginFailed only", err)
+	}
+}
+
+// The book-detail endpoint shares the /eapi/book/ prefix but is not a
+// download: a bare daily-limit there is a request rate limit.
+func TestEAPIBareDailyLimitOnBookDetailIsNotQuota(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"success":0,"error":"Daily limit reached"}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(WithDomain(server.URL))
+	client.SetCookies(map[string]string{"remix_userid": "1", "remix_userkey": "key"})
+	if _, err := client.FetchBook("1:abc"); errors.Is(err, ErrDailyLimitReached) {
+		t.Fatalf("FetchBook error = %v, must not be ErrDailyLimitReached", err)
+	}
+}
+
+func TestEAPIUnrelatedEnvelopeIsNotADailyLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"success":0,"error":"Book not found"}`)
+	}))
+	defer server.Close()
+	_, err := newLoggedInEAPITestClient(server.URL).GetProfile()
+	if errors.Is(err, ErrDailyLimitReached) {
+		t.Fatalf("error = %v, must not be ErrDailyLimitReached", err)
 	}
 }
