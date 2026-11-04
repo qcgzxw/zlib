@@ -64,7 +64,23 @@ func newInlineForm(title, action string, fields []formField) inlineForm {
 	return m
 }
 
-func (m inlineForm) Init() tea.Cmd { return m.focus(m.cursor) }
+func (m inlineForm) Init() tea.Cmd {
+	cmds := []tea.Cmd{m.focus(m.cursor)}
+	if m.resendRemaining() > 0 {
+		cmds = append(cmds, resendTick())
+	}
+	return tea.Batch(cmds...)
+}
+
+// slots is how many tab stops the form has: one per field, the action button
+// and, when enabled, the resend button.
+func (m inlineForm) slots() int {
+	n := len(m.fields) + 1
+	if m.resend {
+		n++
+	}
+	return n
+}
 
 func (m *inlineForm) focus(index int) tea.Cmd {
 	for i := range m.inputs {
@@ -75,7 +91,8 @@ func (m *inlineForm) focus(index int) tea.Cmd {
 			choice.Blur()
 		}
 	}
-	m.cursor = (index + len(m.fields) + 1) % (len(m.fields) + 1)
+	n := m.slots()
+	m.cursor = (index%n + n) % n
 	if m.cursor < len(m.fields) && len(m.fields[m.cursor].options) == 0 {
 		return m.inputs[m.cursor].Focus()
 	}
@@ -86,6 +103,12 @@ func (m *inlineForm) focus(index int) tea.Cmd {
 }
 
 func (m inlineForm) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if _, ok := msg.(resendTickMsg); ok {
+		if m.resendRemaining() > 0 {
+			return m, resendTick()
+		}
+		return m, nil
+	}
 	if size, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width, m.height = size.Width, size.Height
 		for i := range m.inputs {
@@ -108,16 +131,35 @@ func (m inlineForm) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc", "ctrl+c":
 			return m, tea.Quit
 		case "tab", "enter":
-			if k.String() == "enter" && m.cursor == len(m.fields) {
-				cmd := m.submit()
+			if k.String() == "enter" {
+				switch m.cursor {
+				case len(m.fields):
+					cmd := m.submit()
+					if !m.accepted {
+						cmd = m.focus(m.cursor)
+					}
+					return m, cmd
+				case len(m.fields) + 1:
+					if m.resend {
+						cmd := m.submitResend()
+						if !m.accepted {
+							cmd = m.focus(m.cursor)
+						}
+						return m, cmd
+					}
+				}
+			}
+			return m, m.focus(m.cursor + 1)
+		case "shift+tab":
+			return m, m.focus(m.cursor - 1)
+		case "ctrl+r":
+			if m.resend {
+				cmd := m.submitResend()
 				if !m.accepted {
 					cmd = m.focus(m.cursor)
 				}
 				return m, cmd
 			}
-			return m, m.focus(m.cursor + 1)
-		case "shift+tab":
-			return m, m.focus(m.cursor - 1)
 		case "ctrl+s":
 			cmd := m.submit()
 			if !m.accepted {
@@ -155,6 +197,17 @@ func (m inlineForm) View() tea.View {
 	focused := m.cursor == len(m.fields)
 	lines = append(lines, renderActionButton(m.action, focused, false))
 	bindings := []keys.Binding{uiKey("esc", "cancel"), uiKey("tab", "next"), uiKey("shift+tab", "previous"), uiKey("enter", "continue"), uiKey("ctrl+s", strings.ToLower(m.action))}
+	if m.resend {
+		label := "Resend code"
+		remaining := m.resendRemaining()
+		if remaining > 0 {
+			label = fmt.Sprintf("Resend code (%ds)", remaining)
+		}
+		lines = append(lines, "", renderActionButtonState(label, m.cursor == len(m.fields)+1 && remaining == 0, false, remaining > 0))
+		if remaining == 0 {
+			bindings = append(bindings, uiKey("ctrl+r", "resend code"))
+		}
+	}
 	if m.cursor < len(m.fields) && len(m.fields[m.cursor].options) > 0 {
 		bindings = append(bindings, uiKey("↑/↓", "format"), uiKey("space", "toggle"), uiKey("ctrl+a", "all / none"))
 	}

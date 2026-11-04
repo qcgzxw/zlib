@@ -91,7 +91,16 @@ func uiKey(key, label string) keys.Binding {
 // actionButtonRows renders borderless actions and wraps them on narrow screens.
 // Focus is one-based so zero can represent a text field before the actions.
 func renderActionButton(label string, focused, danger bool) string {
+	return renderActionButtonState(label, focused, danger, false)
+}
+
+// renderActionButtonState is renderActionButton for a button that can also be
+// disabled, drawn faint and without the focus highlight.
+func renderActionButtonState(label string, focused, danger, disabled bool) string {
 	style := lipgloss.NewStyle().Foreground(currentTheme.Title).Background(currentTheme.Surface).Padding(0, 2)
+	if disabled {
+		return style.Foreground(currentTheme.Muted).Render(label)
+	}
 	if focused {
 		background := currentTheme.Accent
 		if danger {

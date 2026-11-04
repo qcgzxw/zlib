@@ -228,6 +228,7 @@ func init() {
 	})
 	rootCmd.SetVersionTemplate("{{printf \"%s version %s\\n\" .Name .Version}}")
 	rootCmd.AddCommand(loginCmd)
+	rootCmd.AddCommand(registerCmd)
 	rootCmd.AddCommand(logoutCmd)
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(recommendedCmd)

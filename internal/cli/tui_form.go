@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
@@ -14,6 +15,8 @@ type formField struct {
 	secret             bool
 	options, selected  []string
 	validate           func(string) error
+	// resendChosen is set by inlineForm's resend button; see formModel.resend.
+	resendChosen bool
 }
 
 type formModel struct {
@@ -23,6 +26,32 @@ type formModel struct {
 	input                               textinput.Model
 	editing, accepted                   bool
 	validate                            func([]formField) error
+	// resend adds a second button that submits with resendChosen instead of
+	// accepting, so a caller can re-run a side effect (resend an email)
+	// without leaving the form.
+	resend bool
+	// resendDeadline is when the resend button becomes usable again. A caller
+	// sets it to lastSend+cooldown so the countdown survives a re-prompt.
+	resendDeadline time.Time
+}
+
+// resendRemaining is how many whole seconds the resend button stays disabled.
+func (m formModel) resendRemaining() int {
+	if !m.resend || m.resendDeadline.IsZero() {
+		return 0
+	}
+	wait := time.Until(m.resendDeadline)
+	if wait <= 0 {
+		return 0
+	}
+	return int((wait + time.Second - 1) / time.Second)
+}
+
+// resendTickMsg drives the resend countdown.
+type resendTickMsg struct{}
+
+func resendTick() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return resendTickMsg{} })
 }
 
 func newFormModel(title, action string, fields []formField) formModel {
@@ -50,6 +79,22 @@ func (m *formModel) submit() tea.Cmd {
 			return nil
 		}
 	}
+	m.accepted = true
+	return tea.Quit
+}
+
+// submitResend ends the run with the resend flag set. It skips field
+// validation on purpose: the caller resends precisely because the code in the
+// field was wrong or has not arrived. It does nothing while the cooldown runs.
+func (m *formModel) submitResend() tea.Cmd {
+	if !m.resend {
+		return nil
+	}
+	if remaining := m.resendRemaining(); remaining > 0 {
+		m.message = fmt.Sprintf("You can resend the code in %ds.", remaining)
+		return nil
+	}
+	m.fields[len(m.fields)-1].resendChosen = true
 	m.accepted = true
 	return tea.Quit
 }
@@ -110,6 +155,11 @@ func (m formModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "ctrl+s":
 				cmd := m.submit()
 				return m, cmd
+			case "ctrl+r":
+				if m.resend {
+					cmd := m.submitResend()
+					return m, cmd
+				}
 			case "enter":
 				if m.cursor == len(m.fields) {
 					cmd := m.submit()
